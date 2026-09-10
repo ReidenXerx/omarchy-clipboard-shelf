@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Add this plugin's entries to the Omarchy menu.
+
+  clip-shelf-menu-install            add (or refresh) the entries
+  clip-shelf-menu-install remove     take them out again
+  clip-shelf-menu-install print      write the snippet to stdout, change nothing
+
+Omarchy builds its menu from its own JSONC plus ONE user file,
+~/.config/omarchy/extensions/omarchy-menu.jsonc. Nothing reads plugin manifests, so a
+plugin cannot contribute rows on its own -- this merges them in on the user's behalf.
+
+The entries live between marker comments, so everything else in that file, comments
+included, is preserved byte for byte. Re-running is safe: the old block is replaced
+rather than duplicated.
+"""
+import pathlib
+import re
+import shutil
+import sys
+
+PLUGIN_ID = "reidenxerx.clipboard-shelf"
+PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
+SNIPPET = PLUGIN_DIR / "menu.jsonc"
+EXTENSION = pathlib.Path.home() / ".config/omarchy/extensions/omarchy-menu.jsonc"
+
+BEGIN = f"  // >>> {PLUGIN_ID} (managed by {PLUGIN_ID}-menu-install) >>>"
+END = f"  // <<< {PLUGIN_ID} <<<"
+
+
+def strip_jsonc(raw):
+    """Mirror MenuModel.js stripJsonc exactly, so what validates here is what the menu
+    will accept: whole-line // comments go, and trailing commas are tolerated."""
+    out = re.sub(r"^\s*//[^\n]*(\n|$)", "", raw, flags=re.M)
+    return re.sub(r",(\s*[}\]])", r"\1", out)
+
+
+def valid(raw):
+    import json
+    try:
+        parsed = json.loads(strip_jsonc(raw) or "{}")
+    except Exception:
+        return False
+    return isinstance(parsed, dict)
+
+
+def body():
+    """The plugin's routes, with @PLUGIN_BIN@ resolved to where it is actually installed."""
+    text = SNIPPET.read_text(encoding="utf-8")
+    return text.replace("@PLUGIN_BIN@", str(PLUGIN_DIR / "bin")).rstrip()
+
+
+def without_block(raw):
+    pattern = re.compile(
+        re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n?",
+        re.S)
+    return pattern.sub("", raw)
+
+
+def write(raw):
+    EXTENSION.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    if EXTENSION.exists():
+        backup = EXTENSION.with_suffix(".jsonc.bak")
+        shutil.copy2(EXTENSION, backup)
+    tmp = EXTENSION.with_suffix(".jsonc.tmp")
+    tmp.write_text(raw, encoding="utf-8")
+    tmp.replace(EXTENSION)
+    # A malformed user file makes the menu drop EVERY user entry silently, so never
+    # leave one behind: check what was written and roll back if it does not parse.
+    if not valid(EXTENSION.read_text(encoding="utf-8")):
+        if backup:
+            shutil.copy2(backup, EXTENSION)
+        print(f"{PLUGIN_ID}-menu-install: refusing to leave invalid JSONC; "
+              f"{'restored the previous file' if backup else 'removed the new one'}",
+              file=sys.stderr)
+        if not backup:
+            EXTENSION.unlink(missing_ok=True)
+        return 1
+    return 0
+
+
+def load_existing():
+    if not EXTENSION.exists():
+        return "{\n}\n"
+    raw = EXTENSION.read_text(encoding="utf-8")
+    return raw if raw.strip() else "{\n}\n"
+
+
+def install():
+    raw = without_block(load_existing())
+    if "{" not in raw:
+        raw = "{\n}\n"
+    # Inserted immediately after the opening brace: the block always ends with a comma,
+    # which is only ever valid when something follows it -- and the closing brace does.
+    # (stripJsonc drops trailing commas anyway, but keeping it well-formed means the
+    # file also opens in a plain JSON tool.)
+    head, sep, tail = raw.partition("{")
+    if not sep:
+        print(f"{PLUGIN_ID}-menu-install: {EXTENSION} is not a JSON object", file=sys.stderr)
+        return 1
+    block = "\n" + BEGIN + "\n" + body() + "\n" + END + "\n"
+    return write(head + "{" + block + tail)
+
+
+def remove():
+    if not EXTENSION.exists():
+        print(f"{PLUGIN_ID}-menu-install: nothing to remove")
+        return 0
+    raw = without_block(EXTENSION.read_text(encoding="utf-8"))
+    return write(raw)
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "install"
+    if cmd == "print":
+        print(body())
+        return 0
+    if cmd == "remove":
+        rc = remove()
+        if rc == 0:
+            print(f"Removed {PLUGIN_ID} entries from the Omarchy menu.")
+        return rc
+    if cmd in ("install", "add"):
+        rc = install()
+        if rc == 0:
+            print(f"Added {PLUGIN_ID} entries to the Omarchy menu "
+                  f"({EXTENSION}). The menu watches that file, so they are live now.")
+        return rc
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

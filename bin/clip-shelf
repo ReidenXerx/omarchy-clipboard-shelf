@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Clipboard shelf — manage pinned snippets from the command line.
+
+  clip-shelf list                 show pinned snippets
+  clip-shelf pin <text>           pin a snippet
+  clip-shelf pin --clipboard      pin whatever is on the clipboard right now
+  clip-shelf unpin <index>        remove pin N (as numbered by `list`)
+  clip-shelf copy <index>         put pin N back on the clipboard
+  clip-shelf clear                remove every pin
+  clip-shelf write <json>         replace the pins file (used by the panel)
+
+Pins live in ~/.config/omarchy/clipboard-shelf.json. The panel watches that file, so
+changes show up immediately. History itself is Omarchy's, read-only, from
+~/.local/state/omarchy/clipboard-history.json -- this never captures anything itself.
+"""
+import json
+import pathlib
+import subprocess
+import sys
+
+PINS = pathlib.Path.home() / ".config/omarchy/clipboard-shelf.json"
+HISTORY = pathlib.Path.home() / ".local/state/omarchy/clipboard-history.json"
+
+
+def load():
+    try:
+        raw = json.loads(PINS.read_text())
+    except Exception:
+        return []
+    if isinstance(raw, list):
+        source = raw
+    elif isinstance(raw, dict):
+        source = raw.get("pins", [])
+    else:
+        return []
+    out = []
+    for p in source:
+        if isinstance(p, str):
+            out.append({"type": "text", "text": p})
+        elif isinstance(p, dict) and (p.get("text") is not None or p.get("path")):
+            out.append(p)
+    return out
+
+
+def save(pins):
+    PINS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PINS.with_suffix(".json.tmp")
+    # Temp file then rename: the panel watches this path, and a half-written file would
+    # be read back as invalid JSON and silently empty the shelf.
+    tmp.write_text(json.dumps({"pins": pins}, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(PINS)
+
+
+def preview(entry, width=70):
+    if entry.get("type") == "image":
+        return "[image] " + str(entry.get("path", "")).split("/")[-1]
+    text = " ".join(str(entry.get("text", "")).split())
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def clipboard_text():
+    try:
+        r = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, timeout=5)
+        return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "list"
+    pins = load()
+
+    if cmd == "list":
+        if not pins:
+            print("no pinned snippets — right-click a row in the shelf to pin it")
+            return 0
+        for i, entry in enumerate(pins, 1):
+            print(f"{i:3}  {preview(entry)}")
+        return 0
+
+    if cmd == "pin":
+        if len(argv) >= 3 and argv[2] == "--clipboard":
+            text = clipboard_text()
+            if not text.strip():
+                print("clipboard is empty", file=sys.stderr)
+                return 1
+        elif len(argv) >= 3:
+            text = " ".join(argv[2:])
+        else:
+            print("usage: clip-shelf pin <text> | --clipboard", file=sys.stderr)
+            return 2
+        entry = {"type": "text", "text": text}
+        pins = [p for p in pins if p.get("text") != text]
+        pins.insert(0, entry)
+        save(pins)
+        print(f"pinned: {preview(entry)}")
+        return 0
+
+    if cmd in ("unpin", "copy"):
+        if len(argv) < 3:
+            print(f"usage: clip-shelf {cmd} <index>", file=sys.stderr)
+            return 2
+        try:
+            idx = int(argv[2]) - 1
+        except ValueError:
+            print("index must be a number", file=sys.stderr)
+            return 2
+        if not (0 <= idx < len(pins)):
+            print(f"no pin {argv[2]} (there are {len(pins)})", file=sys.stderr)
+            return 1
+        if cmd == "copy":
+            entry = pins[idx]
+            data = (pathlib.Path(entry["path"]).read_bytes() if entry.get("type") == "image"
+                    else str(entry.get("text", "")).encode())
+            subprocess.run(["wl-copy"], input=data, check=False)
+            print(f"copied: {preview(entry)}")
+        else:
+            removed = pins.pop(idx)
+            save(pins)
+            print(f"unpinned: {preview(removed)}")
+        return 0
+
+    if cmd == "clear":
+        save([])
+        print("shelf cleared")
+        return 0
+
+    if cmd == "write":
+        # Called by the panel. Takes the whole document so the panel never has to know
+        # the on-disk shape.
+        if len(argv) < 3:
+            return 2
+        try:
+            payload = json.loads(argv[2])
+        except Exception:
+            print("clip-shelf write: invalid JSON", file=sys.stderr)
+            return 2
+        save(payload.get("pins", []) if isinstance(payload, dict) else [])
+        return 0
+
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
