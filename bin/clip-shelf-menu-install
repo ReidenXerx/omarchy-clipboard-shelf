@@ -60,9 +60,13 @@ def body():
 
 
 def without_block(raw):
+    # Match this plugin's block whatever its "managed by" text says: earlier installers
+    # named themselves "<plugin id>-menu-install", and a block they wrote must still be
+    # replaced on reinstall and taken out on remove, never duplicated or left behind.
     # install() puts a newline before the BEGIN marker; take it with the block so a
     # remove() leaves the file exactly as it was before the install.
-    pattern = re.compile(r"\n?" + re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n?", re.S)
+    begin_any = r"  // >>> " + re.escape(PLUGIN_ID) + r" \(managed by [^)\n]*\) >>>"
+    pattern = re.compile(r"\n?" + begin_any + r".*?" + re.escape(END) + r"\n?", re.S)
     return pattern.sub("", raw)
 
 
