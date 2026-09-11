@@ -21,6 +21,9 @@ import pathlib
 import re
 import sys
 
+# No __pycache__ next to the plugin: the shell watches the plugin directory and would
+# reload on it, and it is not ours to leave behind in the user's checkout.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import plugin_safety as safe  # noqa: E402
 
