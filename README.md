@@ -1,5 +1,7 @@
 # Clipboard shelf
 
+![Clipboard shelf](preview.png)
+
 An [Omarchy](https://omarchy.org) bar widget that **pins the snippets you paste all day**
 and keeps them one keystroke away, alongside your clipboard history.
 
