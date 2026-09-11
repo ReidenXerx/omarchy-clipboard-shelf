@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "reidenxerx.clipboard-shelf",
   "name": "Clipboard shelf",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "ReidenXerx",
   "license": "MIT",
   "description": "Pin the snippets you paste all day and keep them one keystroke away, alongside your clipboard history. Reads Omarchy's own clipboard history, so nothing is captured twice.",

@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Add this plugin's entries to the Omarchy menu.
 
-  clip-shelf-menu-install            add (or refresh) the entries
-  clip-shelf-menu-install remove     take them out again
-  clip-shelf-menu-install print      write the snippet to stdout, change nothing
+  @SCRIPT@            add (or refresh) the entries
+  @SCRIPT@ remove     take them out again
+  @SCRIPT@ print      write the snippet to stdout, change nothing
 
 Omarchy builds its menu from its own JSONC plus ONE user file,
 ~/.config/omarchy/extensions/omarchy-menu.jsonc. Nothing reads plugin manifests, so a
@@ -11,19 +11,28 @@ plugin cannot contribute rows on its own -- this merges them in on the user's be
 
 The entries live between marker comments, so everything else in that file, comments
 included, is preserved byte for byte. Re-running is safe: the old block is replaced
-rather than duplicated.
+rather than duplicated. Every read is size-capped and every write goes through
+plugin_safety (no symlinks followed, random temporary file, atomic replace). If the
+result would not parse, the previous content -- held in memory, never in a side file --
+is written back.
 """
+import json
 import pathlib
 import re
-import shutil
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import plugin_safety as safe  # noqa: E402
 
 PLUGIN_ID = "reidenxerx.clipboard-shelf"
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
 SNIPPET = PLUGIN_DIR / "menu.jsonc"
-EXTENSION = pathlib.Path.home() / ".config/omarchy/extensions/omarchy-menu.jsonc"
+EXTENSION = pathlib.Path(safe.home_dir()) / ".config/omarchy/extensions/omarchy-menu.jsonc"
 
-BEGIN = f"  // >>> {PLUGIN_ID} (managed by {PLUGIN_ID}-menu-install) >>>"
+SNIPPET_MAX = 64 * 1024
+EXTENSION_MAX = 1024 * 1024
+
+BEGIN = f"  // >>> {PLUGIN_ID} (managed by {pathlib.Path(__file__).name}) >>>"
 END = f"  // <<< {PLUGIN_ID} <<<"
 
 
@@ -35,98 +44,92 @@ def strip_jsonc(raw):
 
 
 def valid(raw):
-    import json
     try:
-        parsed = json.loads(strip_jsonc(raw) or "{}")
-    except Exception:
+        parsed = safe.loads(strip_jsonc(raw) or "{}", max_items=5000, max_string=4096)
+    except (ValueError, safe.TooLarge):
         return False
     return isinstance(parsed, dict)
 
 
 def body():
     """The plugin's routes, with @PLUGIN_BIN@ resolved to where it is actually installed."""
-    text = SNIPPET.read_text(encoding="utf-8")
-    return text.replace("@PLUGIN_BIN@", str(PLUGIN_DIR / "bin")).rstrip()
+    blob = safe.read_file(SNIPPET, SNIPPET_MAX)
+    if blob is None:
+        raise safe.UnsafeError(f"{SNIPPET} is missing")
+    return blob.decode("utf-8").replace("@PLUGIN_BIN@", str(PLUGIN_DIR / "bin")).rstrip()
 
 
 def without_block(raw):
-    pattern = re.compile(
-        re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n?",
-        re.S)
+    # install() puts a newline before the BEGIN marker; take it with the block so a
+    # remove() leaves the file exactly as it was before the install.
+    pattern = re.compile(r"\n?" + re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n?", re.S)
     return pattern.sub("", raw)
 
 
-def write(raw):
-    EXTENSION.parent.mkdir(parents=True, exist_ok=True)
-    backup = None
-    if EXTENSION.exists():
-        backup = EXTENSION.with_suffix(".jsonc.bak")
-        shutil.copy2(EXTENSION, backup)
-    tmp = EXTENSION.with_suffix(".jsonc.tmp")
-    tmp.write_text(raw, encoding="utf-8")
-    tmp.replace(EXTENSION)
-    # A malformed user file makes the menu drop EVERY user entry silently, so never
-    # leave one behind: check what was written and roll back if it does not parse.
-    if not valid(EXTENSION.read_text(encoding="utf-8")):
-        if backup:
-            shutil.copy2(backup, EXTENSION)
-        print(f"{PLUGIN_ID}-menu-install: refusing to leave invalid JSONC; "
-              f"{'restored the previous file' if backup else 'removed the new one'}",
-              file=sys.stderr)
-        if not backup:
-            EXTENSION.unlink(missing_ok=True)
-        return 1
-    return 0
+def current():
+    blob = safe.read_file(EXTENSION, EXTENSION_MAX)
+    return None if blob is None else blob.decode("utf-8")
 
 
-def load_existing():
-    if not EXTENSION.exists():
-        return "{\n}\n"
-    raw = EXTENSION.read_text(encoding="utf-8")
-    return raw if raw.strip() else "{\n}\n"
+def write(raw, previous):
+    safe.write_file(EXTENSION, raw.encode("utf-8"), mode=0o644)
+    # A malformed user file makes the menu drop EVERY user entry silently, so never leave
+    # one behind: check what was written and restore the previous content if it fails.
+    if valid(current() or ""):
+        return 0
+    if previous is None:
+        safe.remove_file(EXTENSION)
+    else:
+        safe.write_file(EXTENSION, previous.encode("utf-8"), mode=0o644)
+    print(f"{PLUGIN_ID}: refusing to leave invalid JSONC; "
+          f"{'restored the previous file' if previous is not None else 'removed the new one'}", file=sys.stderr)
+    return 1
 
 
 def install():
-    raw = without_block(load_existing())
+    previous = current()
+    raw = without_block(previous if previous and previous.strip() else "{\n}\n")
     if "{" not in raw:
         raw = "{\n}\n"
-    # Inserted immediately after the opening brace: the block always ends with a comma,
-    # which is only ever valid when something follows it -- and the closing brace does.
-    # (stripJsonc drops trailing commas anyway, but keeping it well-formed means the
-    # file also opens in a plain JSON tool.)
     head, sep, tail = raw.partition("{")
     if not sep:
-        print(f"{PLUGIN_ID}-menu-install: {EXTENSION} is not a JSON object", file=sys.stderr)
+        print(f"{PLUGIN_ID}: {EXTENSION} is not a JSON object", file=sys.stderr)
         return 1
+    # Inserted right after the opening brace: the block ends with a comma, which is only
+    # valid when something follows it -- and the closing brace does.
     block = "\n" + BEGIN + "\n" + body() + "\n" + END + "\n"
-    return write(head + "{" + block + tail)
+    return write(head + "{" + block + tail, previous)
 
 
 def remove():
-    if not EXTENSION.exists():
-        print(f"{PLUGIN_ID}-menu-install: nothing to remove")
+    previous = current()
+    if previous is None:
+        print(f"{PLUGIN_ID}: nothing to remove")
         return 0
-    raw = without_block(EXTENSION.read_text(encoding="utf-8"))
-    return write(raw)
+    return write(without_block(previous), previous)
 
 
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "install"
-    if cmd == "print":
-        print(body())
-        return 0
-    if cmd == "remove":
-        rc = remove()
-        if rc == 0:
-            print(f"Removed {PLUGIN_ID} entries from the Omarchy menu.")
-        return rc
-    if cmd in ("install", "add"):
-        rc = install()
-        if rc == 0:
-            print(f"Added {PLUGIN_ID} entries to the Omarchy menu "
-                  f"({EXTENSION}). The menu watches that file, so they are live now.")
-        return rc
-    print(__doc__.strip(), file=sys.stderr)
+    try:
+        if cmd == "print":
+            print(body())
+            return 0
+        if cmd == "remove":
+            rc = remove()
+            if rc == 0:
+                print(f"Removed {PLUGIN_ID} entries from the Omarchy menu.")
+            return rc
+        if cmd in ("install", "add"):
+            rc = install()
+            if rc == 0:
+                print(f"Added {PLUGIN_ID} entries to the Omarchy menu ({EXTENSION}). "
+                      "The menu watches that file, so they are live now.")
+            return rc
+    except (safe.UnsafeError, UnicodeDecodeError, OSError) as e:
+        print(f"{PLUGIN_ID}: {e}", file=sys.stderr)
+        return 1
+    print(__doc__.strip().replace("@SCRIPT@", pathlib.Path(argv[0]).name), file=sys.stderr)
     return 2
 
 

@@ -11,15 +11,15 @@
   "setup.clipboard-shelf.pin": {
     "icon": "󰐃",
     "label": "Pin what is on the clipboard",
-    "action": "@PLUGIN_BIN@/clip-shelf pin --clipboard"
+    "action": "/usr/bin/python3 @PLUGIN_BIN@/clip-shelf pin --clipboard"
   },
   "setup.clipboard-shelf.list": {
     "icon": "󰋽",
     "label": "Show pinned snippets",
-    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/clip-shelf list"
+    "action": "omarchy-launch-floating-terminal-with-presentation /usr/bin/python3 @PLUGIN_BIN@/clip-shelf list"
   },
   "setup.clipboard-shelf.clear": {
     "icon": "󰅖",
     "label": "Clear all pins",
-    "action": "@PLUGIN_BIN@/clip-shelf clear"
+    "action": "/usr/bin/python3 @PLUGIN_BIN@/clip-shelf clear"
   },

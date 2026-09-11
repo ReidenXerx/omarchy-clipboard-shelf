@@ -1,146 +1,554 @@
-#!/usr/bin/env python3
-"""Clipboard shelf — manage pinned snippets from the command line.
+#!/usr/bin/python3
+"""Clipboard shelf -- pinned snippets beside Omarchy's clipboard history.
 
-  clip-shelf list                 show pinned snippets
-  clip-shelf pin <text>           pin a snippet
-  clip-shelf pin --clipboard      pin whatever is on the clipboard right now
-  clip-shelf unpin <index>        remove pin N (as numbered by `list`)
-  clip-shelf copy <index>         put pin N back on the clipboard
-  clip-shelf clear                remove every pin
-  clip-shelf write <json>         replace the pins file (used by the panel)
+  clip-shelf list                  show pinned snippets
+  clip-shelf pin <text>            pin text typed on the command line
+  clip-shelf pin --stdin           pin text read from stdin (use this for anything private)
+  clip-shelf pin --clipboard       pin whatever text is on the clipboard right now
+  clip-shelf unpin <n>             remove pin n (as numbered by `list`)
+  clip-shelf copy <n>              put pin n back on the clipboard
+  clip-shelf clear                 remove every pin
 
-Pins live in ~/.config/omarchy/clipboard-shelf.json. The panel watches that file, so
-changes show up immediately. History itself is Omarchy's, read-only, from
+Used by the panel. Entries are addressed by reference -- a 0-based index plus the
+fingerprint `snapshot` printed for it -- so clipboard content never travels through
+process arguments:
+
+  clip-shelf snapshot                                  bounded JSON for display
+  clip-shelf copy    (--history I | --pin I) --fingerprint F
+  clip-shelf preview (--history I | --pin I) --fingerprint F
+  clip-shelf pin     --history I --fingerprint F
+  clip-shelf unpin   --pin I --fingerprint F
+
+Pins live in ~/.config/omarchy/clipboard-shelf.json. History is Omarchy's, read-only, from
 ~/.local/state/omarchy/clipboard-history.json -- this never captures anything itself.
 """
+import hashlib
 import json
+import os
 import pathlib
-import subprocess
+import re
 import sys
+import time
+import urllib.parse
 
-PINS = pathlib.Path.home() / ".config/omarchy/clipboard-shelf.json"
-HISTORY = pathlib.Path.home() / ".local/state/omarchy/clipboard-history.json"
+sys.dont_write_bytecode = True  # no __pycache__ left in the plugin checkout
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import plugin_safety as safe  # noqa: E402
+
+HOME = pathlib.Path(safe.home_dir())
+HISTORY = HOME / ".local/state/omarchy/clipboard-history.json"
+IMAGE_DIR = HOME / ".local/state/omarchy/clipboard-images"
+PINS = HOME / ".config/omarchy/clipboard-shelf.json"
+PREVIEW_DIR = pathlib.Path(safe.runtime_dir()) / "reidenxerx.clipboard-shelf"
+
+# Omarchy keeps 300 history entries; the file is capped well above what that can reach.
+HISTORY_MAX_BYTES = 8 * 1024 * 1024
+HISTORY_LIMITS = {"max_depth": 8, "max_items": 20000, "max_string": 4 * 1024 * 1024}
+HISTORY_WINDOW = 200            # entries shown, and the only ones addressable by index
+
+PINS_MAX_BYTES = 256 * 1024
+PINS_LIMITS = {"max_depth": 8, "max_items": 4000, "max_string": PINS_MAX_BYTES}
+MAX_PINS = 100
+LABEL_CHARS = 200
+
+DISPLAY_CHARS = 2048            # text sent to the panel per entry; enough to classify and filter
+NAME_CHARS = 128
+
+IMAGE_MAX_BYTES = 32 * 1024 * 1024
+IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+               "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}
+MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp",
+            "image/gif": "gif", "image/bmp": "bmp"}
+PREVIEW_MAX_SIDE = 16384
+PREVIEW_MAX_PIXELS = 40_000_000  # ~160 MB decoded; under Qt's own image allocation limit
+PREVIEW_KEEP = 4
+PREVIEW_BUDGET = 64 * 1024 * 1024
+
+CLIPBOARD_MAX = 1024 * 1024
+PASTE_TIMEOUT = 5
+COPY_TIMEOUT = 10
+
+FP_RE = re.compile(r"[0-9a-f]{16}")
+INDEX_RE = re.compile(r"[0-9]{1,4}")
+IMAGE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+PREVIEW_NAME_RE = re.compile(r"preview-[0-9a-f]{16}\.(png|jpg|webp|gif|bmp)")
 
 
-def load():
+class ShelfError(Exception):
+    """A failure worth telling the user about; printed, exit status 1."""
+
+
+# ---------------------------------------------------------------- entries
+
+def normalize(raw, pin=False):
+    """An entry reduced to the fields the shelf uses, or None if it is not one."""
+    if pin and isinstance(raw, str):
+        return {"type": "text", "text": raw}
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("type") == "image":
+        path, mime = raw.get("path"), raw.get("mime")
+        if not isinstance(path, str) or not path:
+            return None
+        return {"type": "image", "path": path, "mime": mime[:64] if isinstance(mime, str) else ""}
+    text = raw.get("text")
+    if not isinstance(text, str):
+        return None
+    entry = {"type": "text", "text": text}
+    label = raw.get("label")
+    if pin and isinstance(label, str) and label:
+        entry["label"] = label[:LABEL_CHARS]
+    return entry
+
+
+def key_of(entry):
+    return ("image:" + entry["path"]) if entry["type"] == "image" else ("text:" + entry["text"])
+
+
+def fingerprint(entry):
+    """First 16 hex digits of sha256 over the entry's identity (its text, or its path)."""
+    return hashlib.sha256(key_of(entry).encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def load_history():
+    """[(index, entry)] for the valid entries among the first HISTORY_WINDOW."""
+    raw = safe.read_json(HISTORY, HISTORY_MAX_BYTES, default=[], **HISTORY_LIMITS)
+    if not isinstance(raw, list):
+        return []
+    return [(i, e) for i, e in ((i, normalize(item)) for i, item in enumerate(raw[:HISTORY_WINDOW])) if e]
+
+
+def load_pins(for_write=False):
+    """[entry]. Raises when the file exists but cannot be used, so a later write never
+    replaces pins that failed to load."""
+    blob = safe.read_file(PINS, PINS_MAX_BYTES)
+    if blob is None:
+        return []
     try:
-        raw = json.loads(PINS.read_text())
-    except Exception:
-        return []
-    if isinstance(raw, list):
-        source = raw
-    elif isinstance(raw, dict):
-        source = raw.get("pins", [])
-    else:
-        return []
-    out = []
-    for p in source:
-        if isinstance(p, str):
-            out.append({"type": "text", "text": p})
-        elif isinstance(p, dict) and (p.get("text") is not None or p.get("path")):
-            out.append(p)
-    return out
+        raw = safe.loads(blob, **PINS_LIMITS)
+    except (ValueError, UnicodeDecodeError):
+        raise ShelfError(f"{PINS} is not valid JSON; fix or remove it") from None
+    if isinstance(raw, dict):
+        raw = raw.get("pins", [])
+    if not isinstance(raw, list):
+        raise ShelfError(f"{PINS} has no pins list; fix or remove it")
+    pins = [e for e in (normalize(p, pin=True) for p in raw) if e]
+    if len(pins) > MAX_PINS:
+        if for_write:
+            raise ShelfError(f"{PINS} holds more than {MAX_PINS} pins; trim it by hand first")
+        pins = pins[:MAX_PINS]
+    return pins
 
 
-def save(pins):
-    PINS.parent.mkdir(parents=True, exist_ok=True)
-    tmp = PINS.with_suffix(".json.tmp")
-    # Temp file then rename: the panel watches this path, and a half-written file would
-    # be read back as invalid JSON and silently empty the shelf.
-    tmp.write_text(json.dumps({"pins": pins}, indent=2, ensure_ascii=False) + "\n")
-    tmp.replace(PINS)
+def save_pins(pins):
+    if len(pins) > MAX_PINS:
+        raise ShelfError(f"the shelf holds at most {MAX_PINS} pins; unpin something first")
+    doc = {"pins": pins}
+    try:
+        blob = (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    except UnicodeEncodeError:  # lone surrogates survive only as escapes
+        blob = (json.dumps(doc, indent=2) + "\n").encode("ascii")
+    if len(blob) > PINS_MAX_BYTES:
+        raise ShelfError(f"pins would exceed {PINS_MAX_BYTES // 1024} KB; unpin something "
+                         "or pin something shorter")
+    # Atomic (random O_EXCL temporary, fsync, rename) and refuses a symlinked or foreign
+    # destination: a half-written file would read back as an empty shelf.
+    safe.write_file(PINS, blob, mode=0o600)
 
 
-def preview(entry, width=70):
-    if entry.get("type") == "image":
-        return "[image] " + str(entry.get("path", "")).split("/")[-1]
-    text = " ".join(str(entry.get("text", "")).split())
+def with_pin(pins, entry):
+    """entry on top; an existing pin of the same thing moves up and keeps its label."""
+    key = key_of(entry)
+    old = next((p for p in pins if key_of(p) == key), None)
+    if old and old.get("label") and not entry.get("label"):
+        entry = dict(entry, label=old["label"])
+    return [entry] + [p for p in pins if key_of(p) != key]
+
+
+def resolve(items, index, fp):
+    """The (index, entry) whose fingerprint is fp: at index if it is still there, otherwise
+    wherever it moved. The caller's reference is only matched, never trusted."""
+    for i, e in items:
+        if i == index and fingerprint(e) == fp:
+            return i, e
+    for i, e in items:
+        if fingerprint(e) == fp:
+            return i, e
+    raise ShelfError("that entry is no longer on the shelf; reopen it and try again")
+
+
+def preview_text(entry, width=70):
+    if entry["type"] == "image":
+        return "[image] " + entry["path"].rsplit("/", 1)[-1][:NAME_CHARS]
+    text = " ".join(entry["text"][:4096].split())
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
-def clipboard_text():
+# ---------------------------------------------------------------- images
+
+def image_path(entry):
+    """(path, mime) for an image entry naming a single file directly inside Omarchy's
+    clipboard image directory with an allowed extension; ShelfError otherwise."""
+    parent, _, name = entry.get("path", "").rpartition("/")
+    home, home_env = safe.home_dir(), os.environ.get("HOME", "")
+    parents = {str(IMAGE_DIR)}
+    if home_env and str(IMAGE_DIR).startswith(home + "/") and os.path.realpath(home_env) == home:
+        parents.add(home_env.rstrip("/") + str(IMAGE_DIR)[len(home):])
+    if parent not in parents or not IMAGE_NAME_RE.fullmatch(name) or "." not in name:
+        raise ShelfError("image is not in Omarchy's clipboard image directory")
+    mime = IMAGE_TYPES.get(name.rsplit(".", 1)[1].lower())
+    if not mime:
+        raise ShelfError("unsupported image type")
+    return IMAGE_DIR / name, mime
+
+
+def _u16(b, o, big=False):
+    return int.from_bytes(b[o:o + 2], "big" if big else "little")
+
+
+def _u32(b, o, big=False, signed=False):
+    return int.from_bytes(b[o:o + 4], "big" if big else "little", signed=signed)
+
+
+def sniff_image(blob):
+    """(mime, width, height) read from the header alone -- nothing is decoded."""
+    b, n = blob, len(blob)
+    if n >= 24 and b[:8] == b"\x89PNG\r\n\x1a\n" and b[12:16] == b"IHDR":
+        mime, w, h = "image/png", _u32(b, 16, big=True), _u32(b, 20, big=True)
+    elif n >= 10 and b[:6] in (b"GIF87a", b"GIF89a"):
+        mime, w, h = "image/gif", _u16(b, 6), _u16(b, 8)
+    elif n >= 26 and b[:2] == b"BM":
+        dib = _u32(b, 14)
+        if dib == 12:
+            w, h = _u16(b, 18), _u16(b, 20)
+        elif dib >= 40:
+            w, h = _u32(b, 18, signed=True), abs(_u32(b, 22, signed=True))
+        else:
+            raise ShelfError("unrecognised BMP header")
+        mime = "image/bmp"
+    elif n >= 30 and b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        chunk, mime = b[12:16], "image/webp"
+        if chunk == b"VP8 " and b[23:26] == b"\x9d\x01\x2a":
+            w, h = _u16(b, 26) & 0x3FFF, _u16(b, 28) & 0x3FFF
+        elif chunk == b"VP8L" and b[20] == 0x2F:
+            bits = _u32(b, 21)
+            w, h = (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        elif chunk == b"VP8X":
+            w, h = int.from_bytes(b[24:27], "little") + 1, int.from_bytes(b[27:30], "little") + 1
+        else:
+            raise ShelfError("unrecognised WebP header")
+    elif n >= 4 and b[:2] == b"\xff\xd8":
+        mime, (w, h) = "image/jpeg", _jpeg_size(b)
+    else:
+        raise ShelfError("not a recognised image")
+    if w <= 0 or h <= 0:
+        raise ShelfError("image header has no size")
+    return mime, w, h
+
+
+def _jpeg_size(b):
+    i, n, steps = 2, len(b), 0
+    while i + 4 <= n and steps < 65536:
+        steps += 1
+        if b[i] != 0xFF:
+            break
+        marker = b[i + 1]
+        if marker == 0xFF:
+            i += 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+            i += 2
+            continue
+        if marker in (0xD9, 0xDA):
+            break
+        length = _u16(b, i + 2, big=True)
+        if length < 2:
+            break
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if i + 9 > n:
+                break
+            return _u16(b, i + 7, big=True), _u16(b, i + 5, big=True)
+        i += 2 + length
+    raise ShelfError("unrecognised JPEG header")
+
+
+def read_image(entry):
+    """(bytes, mime, width, height) for a validated image entry."""
+    path, mime = image_path(entry)
     try:
-        r = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, timeout=5)
-        return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
-    except Exception:
+        blob = safe.read_file(path, IMAGE_MAX_BYTES)
+    except safe.TooLarge:
+        raise ShelfError(f"image is larger than {IMAGE_MAX_BYTES // (1024 * 1024)} MB") from None
+    if blob is None:
+        raise ShelfError("that image is no longer on disk")
+    sniffed, w, h = sniff_image(blob)
+    if sniffed != mime:
+        raise ShelfError("image content does not match its file extension")
+    return blob, mime, w, h
+
+
+# ---------------------------------------------------------------- clipboard
+
+def copy_to_clipboard(data, mime=None):
+    """Pipe data to wl-copy on stdin. spawn() rather than run(): wl-copy forks a server that
+    keeps its inherited stderr open, which would hold a captured pipe until the next copy."""
+    argv = ["wl-copy", "--type", mime] if mime else ["wl-copy"]
+    proc = safe.spawn(argv, timeout=COPY_TIMEOUT, input=data)
+    deadline = time.monotonic() + COPY_TIMEOUT + 5
+    while proc.poll() is None:
+        if time.monotonic() > deadline:
+            raise ShelfError("wl-copy did not finish")
+        time.sleep(0.02)
+    if proc.returncode != 0:
+        raise ShelfError(f"wl-copy failed (exit {proc.returncode})")
+
+
+def clipboard_text():
+    types = safe.run(["wl-paste", "--list-types"], timeout=PASTE_TIMEOUT, max_output=64 * 1024)
+    if types.ok and "x-kde-passwordManagerHint" in types.text().splitlines():
+        raise ShelfError("the clipboard is marked as a password; not pinning it")
+    r = safe.run(["wl-paste", "--no-newline", "--type", "text"],
+                 timeout=PASTE_TIMEOUT, max_output=CLIPBOARD_MAX)
+    if r.truncated:
+        raise ShelfError(f"clipboard text is larger than {CLIPBOARD_MAX // (1024 * 1024)} MB; not pinning it")
+    if r.returncode != 0 or r.timed_out:
         return ""
+    return r.stdout.decode("utf-8", "replace")
+
+
+def entry_bytes(entry):
+    """(data, mime or None) to put on the clipboard."""
+    if entry["type"] == "image":
+        blob, mime, _, _ = read_image(entry)
+        return blob, mime
+    return entry["text"].encode("utf-8", "replace"), None
+
+
+# ---------------------------------------------------------------- panel commands
+
+def emit(doc):
+    # ASCII-only: nothing to mis-decode, and lone surrogates cannot break the write.
+    sys.stdout.write(json.dumps(doc, ensure_ascii=True, separators=(",", ":")) + "\n")
+
+
+def snapshot_item(index, entry):
+    item = {"index": index, "fp": fingerprint(entry), "type": entry["type"]}
+    if entry["type"] == "image":
+        item["name"] = entry["path"].rsplit("/", 1)[-1][:NAME_CHARS]
+        try:
+            _, item["mime"] = image_path(entry)
+            item["previewable"] = True
+        except ShelfError:
+            item["mime"], item["previewable"] = "", False
+    else:
+        item["text"] = entry["text"][:DISPLAY_CHARS]
+        item["truncated"] = len(entry["text"]) > DISPLAY_CHARS
+        if entry.get("label"):
+            item["label"] = entry["label"]
+    return item
+
+
+def cmd_snapshot():
+    errors = []
+    try:
+        history = load_history()
+    except (safe.UnsafeError, OSError) as e:
+        history = []
+        errors.append(f"history: {e}")
+    try:
+        pins = list(enumerate(load_pins()))
+    except (ShelfError, safe.UnsafeError, OSError) as e:
+        pins = []
+        errors.append(f"pins: {e}")
+    emit({"history": [snapshot_item(i, e) for i, e in history],
+          "pins": [snapshot_item(i, e) for i, e in pins],
+          "errors": errors})
+    return 0
+
+
+def items_for(source):
+    return load_history() if source == "history" else list(enumerate(load_pins()))
+
+
+def cmd_copy_ref(source, index, fp):
+    _, entry = resolve(items_for(source), index, fp)
+    data, mime = entry_bytes(entry)
+    copy_to_clipboard(data, mime)
+    return 0
+
+
+def cmd_pin_ref(index, fp):
+    _, entry = resolve(load_history(), index, fp)
+    if entry["type"] == "image":
+        _, mime = image_path(entry)
+        entry = {"type": "image", "path": entry["path"], "mime": mime}
+    pins = load_pins(for_write=True)
+    save_pins(with_pin(pins, entry))
+    return 0
+
+
+def cmd_unpin_ref(index, fp):
+    pins = load_pins(for_write=True)
+    at, _ = resolve(list(enumerate(pins)), index, fp)
+    save_pins(pins[:at] + pins[at + 1:])
+    return 0
+
+
+def prune_previews(keep):
+    """Newest previews only: at most PREVIEW_KEEP files and PREVIEW_BUDGET bytes, and never
+    the one just written."""
+    entries = [(st.st_mtime_ns, name, st.st_size) for name, st in safe.list_dir(PREVIEW_DIR, 256)
+               if PREVIEW_NAME_RE.fullmatch(name)]
+    total, kept = 0, 0
+    for _, name, size in sorted(entries, reverse=True):
+        if name == keep or (kept < PREVIEW_KEEP - 1 and total + size <= PREVIEW_BUDGET):
+            total += size
+            kept += name != keep
+            continue
+        try:
+            safe.remove_file(PREVIEW_DIR / name)
+        except (safe.UnsafeError, OSError):
+            pass
+
+
+def cmd_preview_ref(source, index, fp):
+    """Verify the image (location, owner, size, type, dimensions) and hand the panel a copy
+    in our private runtime directory, so what it decodes is exactly what was checked."""
+    _, entry = resolve(items_for(source), index, fp)
+    if entry["type"] != "image":
+        raise ShelfError("not an image")
+    blob, mime, w, h = read_image(entry)
+    if w > PREVIEW_MAX_SIDE or h > PREVIEW_MAX_SIDE or w * h > PREVIEW_MAX_PIXELS:
+        raise ShelfError(f"image is too large to preview ({w}×{h})")
+    real_fp = fingerprint(entry)
+    name = f"preview-{real_fp}.{MIME_EXT[mime]}"
+    safe.ensure_dir(PREVIEW_DIR)
+    safe.write_file(PREVIEW_DIR / name, blob, mode=0o600)
+    prune_previews(name)
+    emit({"fp": real_fp, "url": "file://" + urllib.parse.quote(str(PREVIEW_DIR / name)),
+          "width": w, "height": h, "mime": mime})
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+
+def parse_ref(args):
+    """(source, index, fingerprint) from --history I / --pin I and --fingerprint F, or None
+    when args are not in reference form."""
+    if not args or args[0] not in ("--history", "--pin"):
+        return None
+    if len(args) != 4 or args[2] != "--fingerprint":
+        raise ShelfError("usage: (--history I | --pin I) --fingerprint F")
+    source, index, fp = args[0][2:], args[1], args[3]
+    if not INDEX_RE.fullmatch(index) or not FP_RE.fullmatch(fp):
+        raise ShelfError("invalid index or fingerprint")
+    return source, int(index), fp
+
+
+def cli_index(args, count, cmd):
+    if len(args) != 1 or not INDEX_RE.fullmatch(args[0]):
+        raise ShelfError(f"usage: clip-shelf {cmd} <n>")
+    n = int(args[0])
+    if not 1 <= n <= count:
+        raise ShelfError(f"no pin {n} (there are {count})")
+    return n - 1
+
+
+def pin_text(text):
+    if not text.strip():
+        raise ShelfError("nothing to pin")
+    entry = {"type": "text", "text": text}
+    save_pins(with_pin(load_pins(for_write=True), entry))
+    print(f"pinned: {preview_text(entry)}")
+    return 0
 
 
 def main(argv):
-    cmd = argv[1] if len(argv) > 1 else "list"
-    pins = load()
+    cmd, args = (argv[1], argv[2:]) if len(argv) > 1 else ("list", [])
+
+    if cmd == "snapshot":
+        return cmd_snapshot()
 
     if cmd == "list":
+        pins = load_pins()
         if not pins:
             print("no pinned snippets — right-click a row in the shelf to pin it")
-            return 0
         for i, entry in enumerate(pins, 1):
-            print(f"{i:3}  {preview(entry)}")
+            print(f"{i:3}  {preview_text(entry)}")
         return 0
 
     if cmd == "pin":
-        if len(argv) >= 3 and argv[2] == "--clipboard":
+        ref = parse_ref(args)
+        if ref:
+            if ref[0] != "history":
+                raise ShelfError("pin takes --history")
+            return cmd_pin_ref(ref[1], ref[2])
+        if args == ["--clipboard"]:
             text = clipboard_text()
             if not text.strip():
-                print("clipboard is empty", file=sys.stderr)
-                return 1
-        elif len(argv) >= 3:
-            text = " ".join(argv[2:])
-        else:
-            print("usage: clip-shelf pin <text> | --clipboard", file=sys.stderr)
-            return 2
-        entry = {"type": "text", "text": text}
-        pins = [p for p in pins if p.get("text") != text]
-        pins.insert(0, entry)
-        save(pins)
-        print(f"pinned: {preview(entry)}")
+                raise ShelfError("clipboard has no text")
+            return pin_text(text)
+        if args == ["--stdin"]:
+            try:
+                text = safe.read_stdin(PINS_MAX_BYTES).decode("utf-8")
+            except safe.TooLarge:
+                raise ShelfError(f"input is larger than {PINS_MAX_BYTES // 1024} KB") from None
+            except UnicodeDecodeError:
+                raise ShelfError("input is not UTF-8 text") from None
+            return pin_text(text[:-1] if text.endswith("\n") else text)
+        if args and not args[0].startswith("--"):
+            return pin_text(" ".join(args))
+        raise ShelfError("usage: clip-shelf pin <text> | --stdin | --clipboard")
+
+    if cmd == "unpin":
+        ref = parse_ref(args)
+        if ref:
+            if ref[0] != "pin":
+                raise ShelfError("unpin takes --pin")
+            return cmd_unpin_ref(ref[1], ref[2])
+        pins = load_pins(for_write=True)
+        idx = cli_index(args, len(pins), cmd)
+        removed = pins.pop(idx)
+        save_pins(pins)
+        print(f"unpinned: {preview_text(removed)}")
         return 0
 
-    if cmd in ("unpin", "copy"):
-        if len(argv) < 3:
-            print(f"usage: clip-shelf {cmd} <index>", file=sys.stderr)
-            return 2
-        try:
-            idx = int(argv[2]) - 1
-        except ValueError:
-            print("index must be a number", file=sys.stderr)
-            return 2
-        if not (0 <= idx < len(pins)):
-            print(f"no pin {argv[2]} (there are {len(pins)})", file=sys.stderr)
-            return 1
-        if cmd == "copy":
-            entry = pins[idx]
-            data = (pathlib.Path(entry["path"]).read_bytes() if entry.get("type") == "image"
-                    else str(entry.get("text", "")).encode())
-            subprocess.run(["wl-copy"], input=data, check=False)
-            print(f"copied: {preview(entry)}")
-        else:
-            removed = pins.pop(idx)
-            save(pins)
-            print(f"unpinned: {preview(removed)}")
+    if cmd == "copy":
+        ref = parse_ref(args)
+        if ref:
+            return cmd_copy_ref(*ref)
+        pins = load_pins()
+        entry = pins[cli_index(args, len(pins), cmd)]
+        copy_to_clipboard(*entry_bytes(entry))
+        print(f"copied: {preview_text(entry)}")
         return 0
+
+    if cmd == "preview":
+        ref = parse_ref(args)
+        if not ref:
+            raise ShelfError("usage: clip-shelf preview (--history I | --pin I) --fingerprint F")
+        return cmd_preview_ref(*ref)
 
     if cmd == "clear":
-        save([])
+        save_pins([])
         print("shelf cleared")
-        return 0
-
-    if cmd == "write":
-        # Called by the panel. Takes the whole document so the panel never has to know
-        # the on-disk shape.
-        if len(argv) < 3:
-            return 2
-        try:
-            payload = json.loads(argv[2])
-        except Exception:
-            print("clip-shelf write: invalid JSON", file=sys.stderr)
-            return 2
-        save(payload.get("pins", []) if isinstance(payload, dict) else [])
         return 0
 
     print(__doc__.strip(), file=sys.stderr)
     return 2
 
 
+def run(argv):
+    try:
+        return main(argv)
+    except ShelfError as e:
+        print(f"clip-shelf: {e}", file=sys.stderr)
+    except safe.UnsafeError as e:
+        print(f"clip-shelf: refused: {e}", file=sys.stderr)
+    except OSError as e:
+        print(f"clip-shelf: {e}", file=sys.stderr)
+    return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(run(sys.argv))

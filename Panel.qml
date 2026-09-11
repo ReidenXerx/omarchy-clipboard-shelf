@@ -16,13 +16,16 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  readonly property string home: Quickshell.env("HOME")
   // Omarchy's clipboard service already runs two persistent `wl-paste --watch` capture
   // processes and already drops password-manager content. Reading its history instead of
   // starting a second watcher means no double capture, the same entries the stock picker
   // shows, and that sensitive-content filtering applies here for free.
-  readonly property string historyPath: home + "/.local/state/omarchy/clipboard-history.json"
-  readonly property string pinsPath: home + "/.config/omarchy/clipboard-shelf.json"
+  //
+  // Nothing here reads those files or touches the clipboard directly. `clip-shelf` does,
+  // with size/depth/count limits, and the panel only ever names an entry by reference
+  // ({ source, index, fingerprint }), so clipboard content never lands in a process's argv.
+  readonly property string pluginBin: String(Qt.resolvedUrl("bin/")).replace("file://", "")
+  readonly property var helper: ["/usr/bin/python3", pluginBin + "clip-shelf"]
 
   property var history: []
   property var pins: []
@@ -37,6 +40,16 @@ Panel {
     ? rows[previewIndex] : null
   readonly property bool previewVisible: !!previewRow && previewRow.kind === "image"
 
+  // The verified copy the helper made for the hovered image, keyed by fingerprint.
+  property string previewUrl: ""
+  property string previewUrlFp: ""
+  property int previewWidth: 0
+  property int previewHeight: 0
+  property string previewRequestFp: ""
+  property string previewFailedFp: ""
+  readonly property bool previewFailed: !!previewRow && previewRow.kind === "image" &&
+    (previewRow.entry.previewable !== true || previewRow.entry.fp === previewFailedFp)
+
   readonly property int maxRows: Number(setting("maxRows", 40))
   readonly property int previewLength: Number(setting("previewLength", 120))
   readonly property bool showGlyph: setting("showGlyph", true) !== false
@@ -44,81 +57,167 @@ Panel {
 
   readonly property var rows: Shelf.buildRows(history, pins, query, maxRows)
 
+  // A helper that overruns its budget is stopped: SIGTERM, then SIGKILL a second later.
+  component Watchdog: Timer {
+    property var process: null
+    property int budget: 5000
+    property bool terminated: false
+    repeat: false
+    function arm() { terminated = false; interval = budget; restart() }
+    onTriggered: {
+      if (!process || !process.running) return
+      if (!terminated) {
+        terminated = true
+        process.running = false
+        interval = 1000
+        restart()
+      } else {
+        process.signal(9)
+      }
+    }
+  }
+
   // ---------------------------------------------------------------- data
 
-  FileView {
-    id: historyFile
-    path: root.historyPath
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: {
-      try { root.history = JSON.parse(text()) || [] } catch (e) { root.history = [] }
+  property bool refreshQueued: false
+
+  function refresh() {
+    if (snapshotProc.running) { root.refreshQueued = true; return }
+    snapshotProc.running = true
+    snapshotWatchdog.arm()
+  }
+
+  function applySnapshot(text) {
+    // The helper bounds this (at most 200 + 100 entries of 2 KB each); refuse anything
+    // wildly beyond that rather than parse it.
+    if (!text || text.length > 8 * 1024 * 1024) return
+    var doc = null
+    try { doc = JSON.parse(text) } catch (e) { return }
+    if (!doc || typeof doc !== "object") return
+    root.history = Shelf.snapshotEntries(doc.history, "history", 200)
+    root.pins = Shelf.snapshotEntries(doc.pins, "pin", 100)
+  }
+
+  Process {
+    id: snapshotProc
+    command: root.helper.concat(["snapshot"])
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applySnapshot(text)
     }
-    onLoadFailed: root.history = []
-  }
-
-  FileView {
-    id: pinsFile
-    path: root.pinsPath
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: {
-      var parsed = null
-      try { parsed = JSON.parse(text()) } catch (e) { parsed = null }
-      root.pins = Shelf.normalizePins(parsed)
+    onExited: {
+      snapshotWatchdog.stop()
+      if (root.refreshQueued) { root.refreshQueued = false; Qt.callLater(root.refresh) }
     }
-    onLoadFailed: root.pins = []
   }
+  Watchdog { id: snapshotWatchdog; process: snapshotProc; budget: 5000 }
 
-  Process { id: writer }
-
-  function savePins(next) {
-    root.pins = next
-    // Written through the CLI so the panel and `clip-shelf` can never disagree about the
-    // file format, and so the write is atomic (temp file then rename) rather than a
-    // half-written file the watcher might read back as invalid.
-    writer.command = [root.pluginBin + "clip-shelf", "write", JSON.stringify({ pins: next })]
-    writer.running = true
-  }
-
-  readonly property string pluginBin: String(Qt.resolvedUrl("bin/")).replace("file://", "")
+  // So the bar tooltip knows the pin count before the shelf is first opened.
+  Component.onCompleted: refresh()
 
   // ---------------------------------------------------------------- actions
 
-  Process { id: copier }
+  // Copy, pin and unpin run one at a time, in order, so a quick right-click on two rows
+  // cannot lose the second.
+  property var actionQueue: []
+  property bool actionNeedsRefresh: false
+
+  function runAction(args, refreshAfter) {
+    if (!args || args.length === 0 || root.actionQueue.length >= 16) return
+    var queue = root.actionQueue.slice()
+    queue.push({ args: args, refresh: refreshAfter })
+    root.actionQueue = queue
+    root.nextAction()
+  }
+
+  function nextAction() {
+    if (actionProc.running || root.actionQueue.length === 0) return
+    var queue = root.actionQueue.slice()
+    var job = queue.shift()
+    root.actionQueue = queue
+    if (job.refresh) root.actionNeedsRefresh = true
+    actionProc.command = root.helper.concat(job.args)
+    actionProc.running = true
+    actionWatchdog.arm()
+  }
+
+  Process {
+    id: actionProc
+    onExited: {
+      actionWatchdog.stop()
+      if (root.actionQueue.length > 0) { Qt.callLater(root.nextAction); return }
+      if (root.actionNeedsRefresh) { root.actionNeedsRefresh = false; root.refresh() }
+    }
+  }
+  // A 32 MB image read plus the hand-off to wl-copy fits well inside this.
+  Watchdog { id: actionWatchdog; process: actionProc; budget: 20000 }
 
   function copyRow(index) {
     var row = rows[index]
     if (!row) return
-    if (row.entry.type === "image") copier.command = ["sh", "-c", "wl-copy < " + shellQuote(row.entry.path)]
-    else copier.command = ["sh", "-c", "printf %s " + shellQuote(String(row.entry.text || "")) + " | wl-copy"]
-    copier.running = true
+    root.runAction(Shelf.refArgs("copy", row.entry), false)
     root.close()
-  }
-
-  function shellQuote(value) {
-    return "'" + String(value).replace(/'/g, "'\\''") + "'"
   }
 
   function togglePinAt(index) {
     var row = rows[index]
     if (!row) return
-    savePins(Shelf.togglePin(pins, row.entry))
+    root.runAction(Shelf.refArgs(row.pinned ? "unpin" : "pin", row.entry), true)
   }
 
   function moveSelection(delta) {
     root.selected = Shelf.clampIndex(root.selected + delta, rows.length)
   }
 
+  // ---------------------------------------------------------------- image preview
+
+  function requestPreview() {
+    var row = root.previewRow
+    if (!row || row.kind !== "image" || row.entry.previewable !== true) return
+    if (row.entry.fp === root.previewRequestFp) return
+    if (previewProc.running) return   // onExited asks again for whatever is hovered then
+    root.previewRequestFp = row.entry.fp
+    previewProc.command = root.helper.concat(Shelf.refArgs("preview", row.entry))
+    previewProc.running = true
+    previewWatchdog.arm()
+  }
+
+  function applyPreview(text) {
+    if (!text || text.length > 4096) return
+    var doc = null
+    try { doc = JSON.parse(text) } catch (e) { return }
+    if (!doc || typeof doc.fp !== "string" || typeof doc.url !== "string") return
+    if (doc.url.indexOf("file:///") !== 0) return
+    root.previewWidth = Number(doc.width) || 0
+    root.previewHeight = Number(doc.height) || 0
+    root.previewUrl = doc.url
+    root.previewUrlFp = doc.fp
+  }
+
+  onPreviewRowChanged: requestPreview()
+
+  Process {
+    id: previewProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyPreview(text)
+    }
+    onExited: function (exitCode) {
+      previewWatchdog.stop()
+      if (exitCode !== 0) root.previewFailedFp = root.previewRequestFp
+      Qt.callLater(root.requestPreview)
+    }
+  }
+  Watchdog { id: previewWatchdog; process: previewProc; budget: 8000 }
+
   onOpenedChanged: {
     if (opened) {
       root.query = ""
       root.selected = 0
-      historyFile.reload()
-      pinsFile.reload()
       root.previewIndex = -1
+      root.previewRequestFp = ""
+      root.previewFailedFp = ""
+      root.refresh()
       searchField.forceActiveFocus()
     }
   }
@@ -335,14 +434,17 @@ Panel {
             id: previewImage
             width: parent.width
             height: parent.height - previewCaption.height - Style.space(6)
-            source: root.previewRow && root.previewRow.entry.path
-              ? "file://" + root.previewRow.entry.path : ""
+            // Only the helper's verified copy (allowed directory, owned regular file,
+            // <= 32 MB, header type and dimensions checked), never a path from history.
+            source: root.previewRow && root.previewRow.entry.fp === root.previewUrlFp
+              ? root.previewUrl : ""
             fillMode: Image.PreserveAspectFit
             asynchronous: true
             cache: false
-            // Decode at display size: clipboard screenshots are full-resolution panels,
-            // and decoding 2560x1600 for a 240px card on every hover is wasteful.
+            // Decode at display size in both directions: clipboard screenshots are
+            // full-resolution panels, and a tall one would otherwise decode at full height.
             sourceSize.width: Style.space(240)
+            sourceSize.height: Style.space(190)
             smooth: true
           }
 
@@ -350,8 +452,9 @@ Panel {
             id: previewCaption
             width: parent.width
             text: previewImage.status === Image.Ready
-              ? previewImage.implicitWidth + "×" + previewImage.implicitHeight
-              : (previewImage.status === Image.Error ? "Preview unavailable" : "Loading…")
+              ? root.previewWidth + "×" + root.previewHeight
+              : (previewImage.status === Image.Error || root.previewFailed
+                 ? "Preview unavailable" : "Loading…")
             color: Color.tooltip.text
             opacity: 0.6
             font.pixelSize: Style.font.caption

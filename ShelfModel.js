@@ -1,6 +1,11 @@
 .pragma library
 
 // Pure logic for the clipboard shelf. No QML, no I/O, so it can be exercised with node.
+//
+// Entries come from `clip-shelf snapshot`, which reads the history and pins files with
+// size, depth and count limits and sends display text only (truncated). The panel never
+// holds a full clipboard entry: it addresses one by { source, index, fp } and the helper
+// re-reads it from disk.
 
 // ---------------------------------------------------------------- kinds
 //
@@ -14,6 +19,11 @@ var PATH_RE = /^(~|\/|\.\/|\.\.\/)[^\n]*$/
 var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 // Deliberately loose: anything multi-line carrying punctuation that prose rarely uses.
 var CODE_HINT_RE = /[{};=<>]|^\s{2,}\S|\bfunction\b|\bconst\b|\bdef\b|\bimport\b/
+var FP_RE = /^[0-9a-f]{16}$/
+
+var HISTORY_LIMIT = 200
+var PINS_LIMIT = 100
+var TEXT_LIMIT = 2048
 
 function classify(entry) {
   if (!entry) return "text"
@@ -47,6 +57,44 @@ function swatchFor(entry) {
   return String(entry.text || "").trim()
 }
 
+// ---------------------------------------------------------------- snapshot
+
+// Re-checks every field of the helper's output, so a malformed entry can neither reach
+// the UI with an unexpected shape nor become a command argument.
+function snapshotEntries(list, source, limit) {
+  var out = []
+  if (!Array.isArray(list)) return out
+  var max = Math.min(limit === undefined ? HISTORY_LIMIT : limit,
+                     source === "pin" ? PINS_LIMIT : HISTORY_LIMIT)
+  for (var i = 0; i < list.length && out.length < max; i++) {
+    var e = list[i]
+    if (!e || typeof e !== "object") continue
+    var index = e.index
+    if (typeof index !== "number" || !isFinite(index) || index < 0 || index > 9999 ||
+        Math.floor(index) !== index) continue
+    if (typeof e.fp !== "string" || !FP_RE.test(e.fp)) continue
+    if (e.type === "image") {
+      out.push({ source: source, index: index, fp: e.fp, type: "image",
+                 name: String(e.name || "").slice(0, 128), mime: String(e.mime || "").slice(0, 64),
+                 previewable: e.previewable === true })
+    } else if (typeof e.text === "string") {
+      out.push({ source: source, index: index, fp: e.fp, type: "text",
+                 text: e.text.slice(0, TEXT_LIMIT), truncated: e.truncated === true,
+                 label: typeof e.label === "string" ? e.label.slice(0, 200) : "" })
+    }
+  }
+  return out
+}
+
+// Arguments that name an entry by reference: never its text or path.
+function refArgs(verb, entry) {
+  if (!entry || typeof entry.fp !== "string" || !FP_RE.test(entry.fp)) return []
+  if (typeof entry.index !== "number" || entry.index < 0 || Math.floor(entry.index) !== entry.index) return []
+  if (entry.source !== "pin" && entry.source !== "history") return []
+  return [verb, entry.source === "pin" ? "--pin" : "--history", String(entry.index),
+          "--fingerprint", entry.fp]
+}
+
 // ---------------------------------------------------------------- preview
 
 function collapse(text, limit) {
@@ -63,33 +111,19 @@ function collapse(text, limit) {
 function previewOf(entry, limit) {
   if (!entry) return ""
   if (String(entry.type) === "image") {
-    var name = String(entry.path || "").split("/").pop()
+    var name = String(entry.name || entry.path || "").split("/").pop()
     return name || "Image"
   }
   return collapse(entry.text, limit)
 }
 
-// A stable identity for an entry, so a pin can point at one and survive a restart.
+// A stable identity for an entry. The helper fingerprints the full text (or path), so the
+// same snippet in history and in pins shares one key even though both are truncated here.
 function keyOf(entry) {
   if (!entry) return ""
-  if (String(entry.type) === "image") return "image:" + String(entry.path || "")
+  if (entry.fp) return "fp:" + String(entry.fp)
+  if (String(entry.type) === "image") return "image:" + String(entry.path || entry.name || "")
   return "text:" + String(entry.text || "")
-}
-
-// ---------------------------------------------------------------- pins
-
-function normalizePins(raw) {
-  var list = []
-  var source = raw && Array.isArray(raw.pins) ? raw.pins : (Array.isArray(raw) ? raw : [])
-  for (var i = 0; i < source.length; i++) {
-    var p = source[i]
-    if (!p) continue
-    if (typeof p === "string") { list.push({ type: "text", text: p }); continue }
-    if (typeof p !== "object") continue
-    if (String(p.type) === "image" && p.path) list.push({ type: "image", path: String(p.path), mime: String(p.mime || "image/png") })
-    else if (p.text !== undefined) list.push({ type: "text", text: String(p.text), label: p.label ? String(p.label) : "" })
-  }
-  return list
 }
 
 function isPinned(pins, entry) {
@@ -98,25 +132,11 @@ function isPinned(pins, entry) {
   return false
 }
 
-function togglePin(pins, entry) {
-  var key = keyOf(entry)
-  var out = []
-  var found = false
-  for (var i = 0; i < pins.length; i++) {
-    if (keyOf(pins[i]) === key) { found = true; continue }
-    out.push(pins[i])
-  }
-  // New pins go on top: the thing you just decided to keep is the thing you are about
-  // to want, and pushing it to the end of a long shelf hides it.
-  if (!found) out.unshift(entry)
-  return out
-}
-
 // ---------------------------------------------------------------- rows
 
 function matches(entry, needle) {
   if (!needle) return true
-  var hay = (String(entry.text || "") + " " + String(entry.path || "") + " " +
+  var hay = (String(entry.text || "") + " " + String(entry.name || entry.path || "") + " " +
              classify(entry) + " " + String(entry.label || "")).toLowerCase()
   return hay.indexOf(needle.toLowerCase()) >= 0
 }
@@ -129,8 +149,10 @@ function buildRows(history, pins, query, limit) {
   var seen = {}
   var i, entry
 
-  for (i = 0; i < pins.length; i++) {
-    entry = pins[i]
+  var pinList = Array.isArray(pins) ? pins : []
+  for (i = 0; i < pinList.length; i++) {
+    entry = pinList[i]
+    if (!entry) continue
     if (!matches(entry, query)) continue
     var pk = keyOf(entry)
     if (seen[pk]) continue
