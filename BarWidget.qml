@@ -53,7 +53,9 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: "󰅌"
-    slotSize: Style.bar.statusSlot
+    // No slotSize override: BarIconButton defaults to Style.bar.iconSlot (27), which is
+    // what the rest of the bar uses. statusSlot is 21, and setting it made this widget
+    // six logical pixels narrower than its neighbours -- visible as a tighter gap.
     // Plain bar foreground, like every other status glyph. An accent tint here reads as
     // a warning rather than as information, and the bar is calmer when one icon does not
     // shout at you about a state you already chose.
