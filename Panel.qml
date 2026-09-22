@@ -262,6 +262,9 @@ Panel {
         spacing: Style.space(8)
 
         Text {
+          // Clipboard content is whatever the last thing you copied put
+          // there, markup included. Rendered literally, never interpreted.
+          textFormat: Text.PlainText
           text: "󰍉"
           color: root.barForeground
           opacity: 0.6
@@ -279,6 +282,9 @@ Panel {
           onTextChanged: root.query = text
 
           Text {
+            // Clipboard content is whatever the last thing you copied put
+            // there, markup included. Rendered literally, never interpreted.
+            textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
             visible: searchField.text === ""
             text: "Type to filter — 1-9 pastes, Ctrl+P pins"
@@ -335,6 +341,9 @@ Panel {
 
           // Position, so Alt+N is readable off the row rather than counted.
           Text {
+            // Clipboard content is whatever the last thing you copied put
+            // there, markup included. Rendered literally, never interpreted.
+            textFormat: Text.PlainText
             visible: index < 9
             text: String(index + 1)
             color: root.barForeground
@@ -353,6 +362,9 @@ Panel {
             border.color: Qt.rgba(root.barForeground.r, root.barForeground.g, root.barForeground.b, 0.3)
           }
           Text {
+            // Clipboard content is whatever the last thing you copied put
+            // there, markup included. Rendered literally, never interpreted.
+            textFormat: Text.PlainText
             visible: root.showGlyph && modelData.kind !== "color"
             text: modelData.glyph
             color: root.barForeground
@@ -362,6 +374,9 @@ Panel {
           }
 
           Text {
+            // Clipboard content is whatever the last thing you copied put
+            // there, markup included. Rendered literally, never interpreted.
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: Shelf.collapse(modelData.preview, root.previewLength)
             color: root.barForeground
@@ -370,6 +385,9 @@ Panel {
           }
 
           Text {
+            // Clipboard content is whatever the last thing you copied put
+            // there, markup included. Rendered literally, never interpreted.
+            textFormat: Text.PlainText
             visible: modelData.pinned
             text: "󰐃"
             color: Color.accent
@@ -449,6 +467,9 @@ Panel {
           }
 
           Text {
+            // Clipboard content is whatever the last thing you copied put
+            // there, markup included. Rendered literally, never interpreted.
+            textFormat: Text.PlainText
             id: previewCaption
             width: parent.width
             text: previewImage.status === Image.Ready
@@ -467,6 +488,9 @@ Panel {
 
     // ---- empty state
     Text {
+      // Clipboard content is whatever the last thing you copied put
+      // there, markup included. Rendered literally, never interpreted.
+      textFormat: Text.PlainText
       Layout.fillWidth: true
       visible: root.rows.length === 0
       horizontalAlignment: Text.AlignHCenter
@@ -479,6 +503,9 @@ Panel {
 
     // ---- footer
     Text {
+      // Clipboard content is whatever the last thing you copied put
+      // there, markup included. Rendered literally, never interpreted.
+      textFormat: Text.PlainText
       Layout.fillWidth: true
       text: root.pinCount > 0
         ? root.pinCount + " pinned · " + root.rows.length + " shown · right-click a row to pin"
