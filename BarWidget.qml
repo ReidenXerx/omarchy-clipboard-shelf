@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // Bar slot for the shelf. Follows the shape Omarchy's own panel widgets use: the panel
@@ -59,7 +60,7 @@ BarWidget {
     // Plain bar foreground, like every other status glyph. An accent tint here reads as
     // a warning rather than as information, and the bar is calmer when one icon does not
     // shout at you about a state you already chose.
-    foreground: root.bar ? root.bar.barForeground : Color.foreground
+    foreground: root.bar ? root.bar.barForeground : Commons.Color.foreground
     tooltipText: root.pinCount > 0
       ? root.pinCount + (root.pinCount === 1 ? " pinned snippet" : " pinned snippets")
       : "Clipboard shelf"

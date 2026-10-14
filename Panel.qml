@@ -3,6 +3,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "ShelfModel.js" as Shelf
 
@@ -253,7 +254,7 @@ Panel {
       Layout.fillWidth: true
       implicitHeight: Style.space(34)
       radius: Style.cornerRadius
-      color: Style.hoverFillFor(root.barForeground, Color.accent)
+      color: Style.hoverFillFor(root.barForeground, Commons.Color.accent)
 
       RowLayout {
         anchors.fill: parent
@@ -331,7 +332,7 @@ Panel {
         implicitHeight: Style.space(34)
         radius: Style.cornerRadius
         color: index === root.selected
-          ? Style.hoverFillFor(root.barForeground, Color.accent) : "transparent"
+          ? Style.hoverFillFor(root.barForeground, Commons.Color.accent) : "transparent"
 
         RowLayout {
           anchors.fill: parent
@@ -390,7 +391,7 @@ Panel {
             textFormat: Text.PlainText
             visible: modelData.pinned
             text: "󰐃"
-            color: Color.accent
+            color: Commons.Color.accent
             font.pixelSize: Style.font.caption
           }
         }
@@ -439,9 +440,9 @@ Panel {
       Rectangle {
         anchors.fill: parent
         radius: Style.cornerRadius
-        color: Color.tooltip.background
+        color: Commons.Color.tooltip.background
         border.width: Style.normalBorderWidth
-        border.color: Color.tooltip.border
+        border.color: Commons.Color.tooltip.border
 
         Column {
           anchors.fill: parent
@@ -476,7 +477,7 @@ Panel {
               ? root.previewWidth + "×" + root.previewHeight
               : (previewImage.status === Image.Error || root.previewFailed
                  ? "Preview unavailable" : "Loading…")
-            color: Color.tooltip.text
+            color: Commons.Color.tooltip.text
             opacity: 0.6
             font.pixelSize: Style.font.caption
             horizontalAlignment: Text.AlignHCenter
