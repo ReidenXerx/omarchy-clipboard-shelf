@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 
 // A text field that holds only what is typed into it.
@@ -7,7 +8,7 @@ import Quickshell.Io
 // size and no deadline, and paste it on Ctrl+V or a middle click the same way. In the shared shell that would let any
 // app stall the shell or fill its memory, so this field draws its text itself and reads keys only. A paste (Ctrl+V or
 // Shift+Insert) is the one time it reads the clipboard: text only, at most pasteBytes of it, within two seconds,
-// through wl-paste.
+// through wl-paste, with nothing of the shell's environment but what wl-paste needs to reach the compositor.
 FocusScope {
   id: field
 
@@ -46,12 +47,16 @@ FocusScope {
     for (var i = 0; i < raw.length; i++) {
       var c = raw.charCodeAt(i)
       if (c === 10 || c === 13 || c === 9) clean += multiline && c === 10 ? raw[i] : (c === 13 ? "" : " ")
-      else if (c >= 32 && c !== 127 && c !== 0xfffd) clean += raw[i]
+      // Left out: control characters (C0, DEL, C1), the replacement character a cut-off paste ends in, line and
+      // paragraph separators, and the invisible marks that reorder text (bidi embeddings, overrides and isolates).
+      else if (c >= 32 && c !== 127 && !(c >= 0x80 && c <= 0x9f) && c !== 0xfffd
+               && !(c >= 0x2028 && c <= 0x202e) && !(c >= 0x2066 && c <= 0x2069)) clean += raw[i]
     }
-    var next = (field.text + clean).slice(0, Math.max(0, maximumLength))
-    var last = next.charCodeAt(next.length - 1)
-    if (last >= 0xd800 && last <= 0xdbff) next = next.slice(0, -1)
-    field.text = next
+    // Only what is added is cut to fit: text already there (a long saved value) is never shortened by a keystroke.
+    var add = clean.slice(0, Math.max(0, maximumLength - field.text.length))
+    var last = add.charCodeAt(add.length - 1)
+    if (last >= 0xd800 && last <= 0xdbff) add = add.slice(0, -1)
+    if (add) field.text = field.text + add
   }
 
   function dropChar(s) {
@@ -66,6 +71,14 @@ FocusScope {
     while (end > 0 && s[end - 1] === " ") end--
     while (end > 0 && s[end - 1] !== " ") end--
     return s.slice(0, end)
+  }
+
+  function consumes(event) {
+    var k = event.key
+    if ([Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End].indexOf(k) >= 0)
+      return true
+    return (event.modifiers & Qt.ControlModifier) !== 0
+      && [Qt.Key_A, Qt.Key_C, Qt.Key_X, Qt.Key_Z, Qt.Key_Y, Qt.Key_U, Qt.Key_K, Qt.Key_W].indexOf(k) >= 0
   }
 
   function paste() {
@@ -99,6 +112,10 @@ FocusScope {
                && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
       event.accepted = true
       field.insert(event.text)
+    } else if (field.consumes(event)) {
+      // Keys a text field owns go no further, as with Qt's own fields: Delete, arrows, Home and End, and the Ctrl
+      // editing shortcuts must not reach whatever is behind the field (a list, a bar editor, a window's undo).
+      event.accepted = true
     }
   }
 
@@ -117,7 +134,8 @@ FocusScope {
     width: field.multiline ? field.width : implicitWidth
     // One line keeps its end in view, where the cursor is.
     x: field.multiline ? 0 : Math.min(0, field.width - caret.width - implicitWidth)
-    y: field.multiline ? 0 : (field.height - height) / 2
+    // A long text keeps its last lines, where the caret is, in view; one line keeps its end in view the same way.
+    y: field.multiline ? Math.min(0, field.height - contentHeight) : (field.height - height) / 2
   }
 
   Text {
@@ -160,10 +178,24 @@ FocusScope {
 
   Process {
     id: paster
+    clearEnvironment: true
+    environment: ({
+      PATH: "/usr/bin",
+      XDG_RUNTIME_DIR: Quickshell.env("XDG_RUNTIME_DIR") || "",
+      WAYLAND_DISPLAY: Quickshell.env("WAYLAND_DISPLAY") || ""
+    })
     command: ["/usr/bin/sh", "-c", "/usr/bin/timeout -k 1 2 /usr/bin/wl-paste --no-newline --type text 2>/dev/null | /usr/bin/head -c "
               + field.pasteBytes]
     stdout: StdioCollector {
-      onStreamFinished: if (!field.readOnly) field.insert(text)
+      // A paste that arrives after you moved on is dropped rather than typed into a field you left.
+      onStreamFinished: if (!field.readOnly && field.activeFocus) field.insert(text)
     }
+  }
+
+  // timeout(1) bounds wl-paste; this bounds the whole pipeline, so a paste that never ends cannot block the next.
+  Timer {
+    interval: 4000
+    running: paster.running
+    onTriggered: if (paster.running) paster.signal(9)
   }
 }
