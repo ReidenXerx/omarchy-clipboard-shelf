@@ -272,29 +272,19 @@ Panel {
           font.pixelSize: Style.font.body
         }
 
-        TextInput {
+        // Typed keys only: Qt's own text fields would read every new clipboard entry into the shell unbounded.
+        KeyField {
           id: searchField
           Layout.fillWidth: true
           color: root.barForeground
+          placeholderColor: Qt.rgba(root.barForeground.r, root.barForeground.g, root.barForeground.b, 0.4)
+          placeholderText: "Type to filter — 1-9 pastes, Ctrl+P pins"
+          maximumLength: 200
           font.pixelSize: Style.font.body
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
-          selectByMouse: true
-          clip: true
           onTextChanged: root.query = text
 
-          Text {
-            // Clipboard content is whatever the last thing you copied put
-            // there, markup included. Rendered literally, never interpreted.
-            textFormat: Text.PlainText
-            anchors.verticalCenter: parent.verticalCenter
-            visible: searchField.text === ""
-            text: "Type to filter — 1-9 pastes, Ctrl+P pins"
-            color: root.barForeground
-            opacity: 0.4
-            font: searchField.font
-          }
-
-          Keys.onPressed: function (event) {
+          keyFilter: function (event) {
             if (event.key === Qt.Key_Down)      { root.moveSelection(1);  event.accepted = true }
             else if (event.key === Qt.Key_Up)   { root.moveSelection(-1); event.accepted = true }
             else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
